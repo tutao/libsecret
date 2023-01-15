@@ -9,12 +9,9 @@ variables:
 
 fedora:Werror:
   stage: build
-  before_script:
-    - dbus-uuidgen --ensure
   script:
     - meson _build -Dwerror=true -Dc_args=-Wno-error=deprecated-declarations -Dgtk_doc=false
     - meson compile -C _build
-    - eval `dbus-launch --sh-syntax`
     - meson test -C _build
   artifacts:
     when: on_failure
@@ -23,12 +20,9 @@ fedora:Werror:
 
 fedora:asan:
   stage: build
-  before_script:
-    - dbus-uuidgen --ensure
   script:
     - meson _build -Db_sanitize=address -Dgtk_doc=false -Dintrospection=false
     - meson compile -C _build
-    - eval `dbus-launch --sh-syntax`
     - meson test -C _build
   allow_failure: true
   artifacts:
@@ -38,12 +32,9 @@ fedora:asan:
 
 fedora:ubsan:
   stage: build
-  before_script:
-    - dbus-uuidgen --ensure
   script:
     - meson _build -Db_sanitize=undefined -Dgtk_doc=false
     - meson compile -C _build
-    - eval `dbus-launch --sh-syntax`
     - meson test -C _build
   artifacts:
     when: on_failure
@@ -52,8 +43,6 @@ fedora:ubsan:
 
 fedora-static-analyzers/test:
   stage: build
-  before_script:
-    - dbus-uuidgen --ensure
   script:
     - meson _build -Dgtk_doc=false
     - meson compile -C _build --ninja-args scan-build
@@ -65,12 +54,9 @@ fedora-static-analyzers/test:
 
 fedora:coverage:
   stage: build
-  before_script:
-    - dbus-uuidgen --ensure
   script:
     - meson _build -Db_coverage=true -Dtpm2=true -Dgtk_doc=false
     - meson compile -C _build
-    - eval `dbus-launch --sh-syntax`
     - export XDG_CONFIG_HOME=$HOME/.config
     - /usr/share/swtpm/swtpm-create-user-config-files --root
     - mkdir -p ${XDG_CONFIG_HOME}/mytpm1
