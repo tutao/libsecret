@@ -23,16 +23,23 @@ EGG_SECURE_DECLARE (secret_file_collection);
 
 #ifdef WITH_GCRYPT
 #include <gcrypt.h>
+#define PBKDF2_HASH_ALGO GCRY_MD_SHA256
+#define MAC_ALGO GCRY_MAC_HMAC_SHA256
+#define CIPHER_ALGO GCRY_CIPHER_AES256
 #endif
 
-#define PBKDF2_HASH_ALGO GCRY_MD_SHA256
+#ifdef WITH_GNUTLS
+#include <gnutls/crypto.h>
+#define PBKDF2_HASH_ALGO GNUTLS_MAC_SHA256
+#define MAC_ALGO GNUTLS_MAC_SHA256
+#define CIPHER_ALGO GNUTLS_CIPHER_AES_256_CBC
+#endif
+
 #define SALT_SIZE 32
 #define ITERATION_COUNT 100000
 
-#define MAC_ALGO GCRY_MAC_HMAC_SHA256
 #define MAC_SIZE 32
 
-#define CIPHER_ALGO GCRY_CIPHER_AES256
 #define CIPHER_BLOCK_SIZE 16
 #define IV_SIZE CIPHER_BLOCK_SIZE
 
@@ -85,6 +92,8 @@ get_file_last_modified (SecretFileCollection *self)
 	return res;
 }
 
+#ifdef WITH_GCRYPT
+
 static gboolean
 do_derive_key (SecretFileCollection *self)
 {
@@ -101,6 +110,13 @@ do_derive_key (SecretFileCollection *self)
 						CIPHER_BLOCK_SIZE,
 						egg_secure_free,
 						key);
+
+	if (!self->salt) {
+		guint8 salt[SALT_SIZE];
+
+		gcry_create_nonce (salt, sizeof(salt));
+		self->salt = g_bytes_new (salt, sizeof(salt));
+	}
 
 	n_salt = g_bytes_get_size (self->salt);
 	gcry = gcry_kdf_derive (password, n_password,
@@ -237,6 +253,137 @@ do_encrypt (SecretFileCollection *self,
 	return ret;
 }
 
+#endif /* WITH_GCRYPT */
+
+#ifdef WITH_GNUTLS
+
+static gboolean
+do_derive_key (SecretFileCollection *self)
+{
+	gsize n_password;
+	gchar *key;
+	gnutls_datum_t password, salt;
+	int ret;
+
+	key = egg_secure_alloc (CIPHER_BLOCK_SIZE);
+	self->key = g_bytes_new_with_free_func (key,
+						CIPHER_BLOCK_SIZE,
+						egg_secure_free,
+						key);
+
+	password.data = (void *)secret_value_get (self->password, &n_password);
+	password.size = n_password;
+
+	if (!self->salt) {
+		guint8 salt[SALT_SIZE];
+
+		gnutls_rnd (GNUTLS_RND_NONCE, salt, sizeof(salt));
+		self->salt = g_bytes_new (salt, sizeof(salt));
+	}
+
+	salt.data = (void *)g_bytes_get_data (self->salt, NULL);
+	salt.size = g_bytes_get_size (self->salt);
+
+	ret = gnutls_pbkdf2 (PBKDF2_HASH_ALGO, &password, &salt,
+			     self->iteration_count,
+			     key, CIPHER_BLOCK_SIZE);
+	return ret < 0 ? FALSE : TRUE;
+}
+
+static gboolean
+do_calculate_mac (SecretFileCollection *self,
+		  const guint8 *value, gsize n_value,
+		  guint8 *buffer)
+{
+	gconstpointer secret;
+	gsize n_secret;
+	int ret;
+
+	secret = g_bytes_get_data (self->key, &n_secret);
+	ret = gnutls_hmac_fast (MAC_ALGO, secret, n_secret, value, n_value,
+				buffer);
+	return ret < 0 ? FALSE : TRUE;
+}
+
+static gboolean
+do_verify_mac (SecretFileCollection *self,
+	       const guint8 *value, gsize n_value,
+	       const guint8 *data)
+{
+	guint8 buffer[MAC_SIZE];
+	guint8 status = 0;
+	gsize i;
+
+	if (!do_calculate_mac (self, value, n_value, buffer)) {
+		return FALSE;
+	}
+
+	for (i = 0; i < MAC_SIZE; i++) {
+		status |= data[i] ^ buffer[i];
+	}
+
+	return status == 0;
+}
+
+static gboolean
+do_decrypt (SecretFileCollection *self,
+	    guint8 *data,
+	    gsize n_data)
+{
+	gnutls_cipher_hd_t hd = NULL;
+	int ret;
+	gsize n_secret;
+	gnutls_datum_t key, iv;
+
+	key.data = (void *)g_bytes_get_data (self->key, &n_secret);
+	key.size = n_secret;
+
+	iv.data = data + n_data;
+	iv.size = IV_SIZE;
+
+	ret = gnutls_cipher_init (&hd, CIPHER_ALGO, &key, &iv);
+	if (ret < 0) {
+		return FALSE;
+	}
+
+	ret = gnutls_cipher_decrypt2 (hd, data, n_data, data, n_data);
+	if (ret < 0) {
+		gnutls_cipher_deinit (hd);
+		return FALSE;
+	}
+
+	gnutls_cipher_deinit (hd);
+	return TRUE;
+}
+
+static gboolean
+do_encrypt (SecretFileCollection *self,
+	    guint8 *data,
+	    gsize n_data)
+{
+	gnutls_cipher_hd_t hd = NULL;
+	int ret;
+	gsize n_secret;
+	gnutls_datum_t key, iv;
+
+	key.data = (void *)g_bytes_get_data (self->key, &n_secret);
+	key.size = n_secret;
+
+	iv.data = data + n_data;
+	iv.size = IV_SIZE;
+	ret = gnutls_rnd (GNUTLS_RND_NONCE, iv.data, iv.size);
+	g_return_val_if_fail (ret >= 0, FALSE);
+
+	ret = gnutls_cipher_init (&hd, CIPHER_ALGO, &key, &iv);
+	g_return_val_if_fail (ret >= 0, FALSE);
+
+	ret = gnutls_cipher_encrypt2 (hd, data, n_data, data, n_data);
+	gnutls_cipher_deinit (hd);
+	return ret < 0 ? FALSE : TRUE;
+}
+
+#endif /* WITH_GNUTLS */
+
 static void
 secret_file_collection_init (SecretFileCollection *self)
 {
@@ -309,8 +456,9 @@ secret_file_collection_class_init (SecretFileCollectionClass *klass)
 		   g_param_spec_boxed ("password", "password", "Password",
 				       SECRET_TYPE_VALUE,
 				       G_PARAM_WRITABLE | G_PARAM_CONSTRUCT_ONLY));
-
+#ifdef WITH_GCRYPT
 	egg_libgcrypt_initialize ();
+#endif
 }
 
 static gboolean
